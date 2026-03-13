@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "@std/streams": "jsr:@std/streams@^1.0.17",
+    "pyodide": "npm:pyodide@^0.29.3"
+  },
+    "vendor": true,
+    "lock": { "frozen": true }
+}

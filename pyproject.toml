@@ -1,0 +1,22 @@
+[project]
+name = "teleology"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Bjarte Johansen", email = "bjajoh@equinor.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "azure-identity>=1.25.2",
+    "diskcache>=5.6.3",
+    "duckdb>=1.4.4",
+    "faker>=40.5.1",
+    "openai>=2.24.0",
+    "wasmer>=1.1.0",
+    "wasmer-compiler-cranelift>=1.1.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.3,<0.11.0"]
+build-backend = "uv_build"
