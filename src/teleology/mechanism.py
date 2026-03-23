@@ -1,8 +1,9 @@
+# Social anarchic, mad, and misbehaving agents collaboratively solving tasks
+# I will address each of these topics through the presentation.
 import asyncio
 import contextlib
 import functools
 import inspect
-import json
 import math
 import operator as op
 import os
@@ -11,48 +12,57 @@ import re
 import sqlite3
 import textwrap
 import threading
-from abc import ABC, abstractmethod
+
+from abc import ABC
 from collections.abc import AsyncIterator, Iterable
 from compression import zstd
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta
 from itertools import chain, islice, repeat, starmap, zip_longest
 from pathlib import Path
+
+# I use typing and types, but I don't generally use any type checker.
+# I just like to annotated the code with what I expect to be at the
+# bounderies of my code.
 from types import TracebackType
-from typing import Annotated, Callable, Awaitable, Literal, Self
+from typing import Annotated, Awaitable, Callable, Literal, Self
 
 import azure.identity.aio as identity
 import openai
-from faker import Faker
-from openai import (
-    APIConnectionError,
-    InternalServerError,
-    RateLimitError,
-)
+
+from faker import Faker  # not strictly needed, but makes it more fun...
+from openai import APIConnectionError, InternalServerError, RateLimitError
+from openai.types.responses import Response, ToolParam
 from openai.types.responses import ResponseFunctionToolCall as ToolCall
 from openai.types.responses import ResponseInputParam as Message
 from openai.types.responses import ResponseInputText as InputText
-from openai.types.responses import ResponseOutputText as OutputText
-from openai.types.responses import ResponseOutputMessage as OutputMessage
 from openai.types.responses import ResponseReasoningItem as ReasoningItem
-from openai.types.responses import Response, ToolParam
 from openai.types.responses.response_input_item import (
     FunctionCallOutput as ToolResponse,
 )
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic.json_schema import GenerateJsonSchema
 
+# We could probably do without pydantic, but the openai library
+# already needs it... an interesting note is that pythons standard
+# library is LARGE and quite useful.
+
 
 MODEL_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
 MODEL_DEPLOYMENT = os.environ["AZURE_OPENAI_MODEL"]
 
 DATABASE = os.environ.get("TELE_DATABASE", "data.sqlite")
-
 DATA_DIR = Path(os.environ.get("TELE_DATA_DIR", "data")).absolute()
 
 MAX_STEPS = os.environ.get("TELE_MAX_STEPS", 100)
 MAX_VOTES = os.environ.get("TELE_MAX_VOTES", 3)
 MAX_RETRY_LIMIT = os.environ.get("TELE_RETRY_LIMIT", 5)
+
+
+# MAD agents Each agent divides its task into sub-tasks and requests
+# "specialist" agents to solve the new sub-task, making the actual
+# task each agent solves small.
+# ref: https://arxiv.org/html/2511.09030v1
 
 SYSTEM_PROMPT = """\
 You are a helpful agent.
@@ -64,9 +74,10 @@ the current working directory. All agents have access to the data.
 The tasks you are given can be very complex, so follow these steps:
 
   - Investigate your notebook
-  - Note down interesting information in your notebook
   - Formulate a plan for how to solve the task
+  - Note down interesting information in your notebook
   - Divide the task into sub-tasks
+  - Note down acceptance criteria for your sub-tasks in your notebook
   - Request specialist agents do the sub-tasks
   - Compile a report from your findings
 
@@ -75,13 +86,10 @@ need help to interpret the task you should ask a specialist.
 
 Try to delegate as many tasks as you can, unless it is a single simple
 task that you can solve immediately.
-
-Note down anything you would need to evaluate the result of your
-delegated tasks.
  """
 
-
-ServerError = APIConnectionError | InternalServerError
+# I didn't want to implement user and agent feedback. It could be a
+# cool thing to continue with....
 
 
 class Attempt(AbstractAsyncContextManager):
@@ -110,7 +118,7 @@ class Attempt(AbstractAsyncContextManager):
         if isinstance(exc_val, ValidationError):
             return True
 
-        if isinstance(exc_val, ServerError):
+        if isinstance(exc_val, APIConnectionError | InternalServerError):
             await asyncio.sleep(1.0 + self.retry**2)
             return True
 
@@ -150,7 +158,7 @@ class LLM:
             openai.AsyncOpenAI(
                 base_url=f"{MODEL_ENDPOINT}/openai/v1",
                 api_key=identity.get_bearer_token_provider(
-                    await self._stack.enter_async_context(
+                    await self._stack.enter_async_context(  # <- this is why I use the stack
                         identity.DefaultAzureCredential()
                     ),
                     "https://cognitiveservices.azure.com/.default",
@@ -174,9 +182,13 @@ class LLM:
         tools: list[ToolParam],
         text_format: type[BaseModel] | None = None,
     ) -> Response:
-
         kwargs = {}
         if text_format:
+            # I am not handling $ref here. I am not sure if that is
+            # neccessary or not anymore... the openai-python converts
+            # it, but we are just using simple types here so we don't
+            # have to worry about that...
+
             schema = text_format.model_json_schema()
             schema["additionalProperties"] = False
             required = schema["required"] = []
@@ -201,13 +213,13 @@ class LLM:
                     input=messages,
                     tools=tools,
                     tool_choice="auto",
-                    reasoning=dict(
-                        effort="low",
-                        summary="concise",
-                    ),
-                    store=False,
-                    include=["reasoning.encrypted_content"],
                     parallel_tool_calls=True,
+                    reasoning={
+                        "effort": "low",
+                        "summary": "concise",
+                    },
+                    include=["reasoning.encrypted_content"],
+                    store=False,
                     **kwargs,
                 )
 
@@ -215,10 +227,14 @@ class LLM:
 
 
 class GenerateJsonSchema(GenerateJsonSchema):
+    # Openai doesn't like the title field...
     def field_title_should_be_set(self, _) -> bool:
         return False
 
 
+# It is cached because making typeadapters is really expensive. We
+# could maybe make the schema ourselves, but this is just so easy when
+# we already have pydantic right there!
 @functools.cache
 def schema(fn: Tool) -> ToolParam:
     return {
@@ -249,27 +265,36 @@ class Database:
             self.conn.commit()
             return value
 
-    def executemany(self, query: str, params: tuple | List[tuple] = ()):
+    def executemany(self, query: str, params: tuple | list[tuple] = ()):
         with self.lock:
             value = self.conn.executemany(query, params).fetchall()
             self.conn.commit()
             return value
 
 
+# Make a global variable and just lock everything! We want everything
+# to run in the same process anyway. In a production setting we would
+# do this differently.
 db = Database(DATABASE)
 
 
+# Just to generate names for the agents.
 fake = Faker(["no_NO", "en_GB", "it_IT", "fr_FR", "de_DE"])
 
 
+# An agent is nothing more than an id and a name. Everything else is
+# just state that belongs somewhere else.
 class Agent(BaseModel):
     id: int
     name: str
 
 
+# Setup the database and find the first agent.
 def init_app() -> Agent:
     db.execute("PRAGMA journal_mode=WAL")
 
+    # We want to use sampling to find agents--easiest if we can do it
+    # in the database.
     db.create_function("betavariate", 2, random.betavariate, deterministic=False)
 
     db.execute(
@@ -281,6 +306,10 @@ def init_app() -> Agent:
         )
         """
     )
+
+    # Each agent has a belief about how well another agent will
+    # perform based on what they themselves have observed of successes
+    # and failures.
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS belief (
@@ -311,6 +340,8 @@ def init_app() -> Agent:
         CREATE INDEX IF NOT EXISTS idx_belief_target_id ON belief (target_id)
         """
     )
+
+    # Each agent keeps a notebook
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS note (
@@ -327,6 +358,8 @@ def init_app() -> Agent:
         )
         """
     )
+
+    # That can be searched
     db.execute(
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(
@@ -361,6 +394,7 @@ def init_app() -> Agent:
         """
     )
 
+    # Make a couple of initial agents!
     n_agents = db.execute("SELECT count(*) FROM agent")[0][0]
     if n := max(0, 10 - n_agents):
         db.executemany(
@@ -368,7 +402,8 @@ def init_app() -> Agent:
             [(fake.name(),) for _ in range(n)],
         )
 
-    # Thompson sampling
+    # We use Thompson sampling to find a suitable agent
+    # https://en.wikipedia.org/wiki/Thompson_sampling
     ident, name, p = db.execute(
         """
         WITH outcome (id, name, success, failure) AS (
@@ -388,18 +423,34 @@ def init_app() -> Agent:
         """
     )[0]
 
+    # If our candidate has a probabilty of less than 50%, we create a
+    # new one.
     if p < 0.5:
         name = fake.name()
         (ident,) = db.execute(
             "INSERT INTO agent (name) VALUES (:name) RETURNING id",
-            dict(name=name),
+            {"name": name},
         )[0]
 
     return Agent(id=ident, name=name)
 
 
+# Agent reward is not through a capitalist monetary reward system, but
+# relies on trust and experience. Each agent chooses using sampling
+# from observed success and failure among the other agents.
+#
+# Eventually this _should_ create specialisation, community, and
+# collaboration without hierarchy.
+#
+# A key component of other agent systems that I have seen either
+# relies on some form of tokens and on a single leader/orchestrator
+# that is responsible for keeping track of work. Here all agents are
+# treated as equal and can be a orchestrator.
+
+
+# A particular agent can also use Thompson sampling to find a suitable
+# candidate to delegate a task to.
 def sample(agent: Agent) -> Agent:
-    # Thompson sampling
     ident, name, p = db.execute(
         """
         WITH outcome (id, name, success, failure) AS (
@@ -417,7 +468,7 @@ def sample(agent: Agent) -> Agent:
         ORDER BY p DESC
         LIMIT 1
         """,
-        dict(id=agent.id),
+        {"id": agent.id},
     )[0]
 
     if p < 0.5:
@@ -426,13 +477,14 @@ def sample(agent: Agent) -> Agent:
                 name = fake.name()
                 (ident,) = db.execute(
                     "INSERT INTO agent (name) VALUES (:name) RETURNING id",
-                    dict(name=name),
+                    {"name": name},
                 )[0]
                 break
 
     return Agent(id=ident, name=name)
 
 
+# After delegation, the agent needs to update its belief.
 def update_belief(
     agent: Agent,
     target: Agent,
@@ -443,7 +495,7 @@ def update_belief(
         INSERT OR IGNORE INTO belief (agent_id, target_id, success, failure)
         VALUES (:aid, :tid, 0, 0)
         """,
-        dict(aid=agent.id, tid=target.id),
+        {"aid": agent.id, "tid": target.id},
     )
     db.execute(
         """
@@ -452,37 +504,35 @@ def update_belief(
             failure = failure + :failure
         WHERE agent_id = :aid AND target_id = :tid
         """,
-        dict(
-            aid=agent.id,
-            tid=target.id,
-            success=int(status == "success"),
-            failure=int(status == "failure"),
-        ),
+        {
+            "aid": agent.id,
+            "tid": target.id,
+            "success": int(status == "success"),
+            "failure": int(status == "failure"),
+        },
     )
 
 
 def insert_note(agent: Agent, title: str, content: str) -> int:
-
     (ident,) = db.execute(
         """
         INSERT INTO note (agent_id, title, content)
         VALUES (:aid, :title, :content)
         RETURNING id
         """,
-        dict(aid=agent.id, title=title, content=content),
+        {"aid": agent.id, "title": title, "content": content},
     )[0]
     return ident
 
 
 def delete_note(agent: Agent, id: int) -> int:
-
     db.execute(
         """
         DELETE FROM note
         WHERE agent_id = :aid AND id = :nid
         RETURNING id
         """,
-        dict(aid=agent.id, nid=id),
+        {"aid": agent.id, "nid": id},
     )
     return id
 
@@ -495,7 +545,7 @@ def get_note(id: int) -> int:
         WHERE id = :id
         RETURNING id, title, content
         """,
-        dict(id=id),
+        {"id": id},
     )
 
     return note[0]
@@ -510,11 +560,15 @@ def get_latest_note_titles(agent: Agent, n=10):
         ORDER BY visited_at DESC
         LIMIT :n
         """,
-        dict(id=agent.id, n=n),
+        {"id": agent.id, "n": n},
     )
     return notes
 
 
+# Only BM25 search--this should probably be tuned to the kind of
+# searches that the agents does and it probably wouldn't hurt to
+# include nearest-neighbour vector search as well. I kept to bm25 as
+# it is is built in to sqlite and I didn't need any more imports...
 def search_notes(query: str) -> list[tuple[int, str, str]]:
     return db.execute(
         """
@@ -532,6 +586,9 @@ def search_notes(query: str) -> list[tuple[int, str, str]]:
     )
 
 
+# These classes are strictly not neccessary, but since we have
+# pydantic anyway, we can make the management of input and output from
+# the model easier by defining and using them.
 class NoteId(BaseModel):
     id: int
 
@@ -552,11 +609,13 @@ class Hits(BaseModel):
     hits: list[Hit]
 
 
+# This is pure convenience and so that we can see what is going on in
+# the network.
 class StdoutMixin(ABC):
     def stdout(self, content: str | Iterable[str], sep: str = "|"):
         content = [content] if isinstance(content, str) else content
         content = "\n".join(content)
-        content = textwrap.indent(content, f"{self.agent.id:03d}{sep} ")
+        content = textwrap.indent(content, f"{self.agent.id:04d}{sep} ")
         print(content)
 
 
@@ -564,11 +623,20 @@ class Failed(BaseModel):
     error: str
 
 
+# The notebook is necessary as that is the premise for the
+# spesialisation of the agents. It is how the agent has an opportunity
+# to affect its own prompt. It will do that by the summary in the
+# notebook and through search and getting notes. You can also think
+# about this as a way to introduce skills. This could be made more
+# explicit by also adding topics to the notes.
 class Notebook(StdoutMixin):
     def __init__(self, agent: Agent):
         self.agent = agent
 
     async def summary(self) -> AsyncIterator[str]:
+        """
+        A summary is in our case the id and title of the n latest notes.
+        """
         notes = await asyncio.to_thread(get_latest_note_titles, self.agent, 10)
 
         summary = ["<notebook>", "NOTE_ID\tTITLE"]
@@ -684,6 +752,10 @@ class Notebook(StdoutMixin):
         return Hits(hits=hits)
 
 
+class Code(BaseModel):
+    code: str
+
+
 class Result(BaseModel):
     output: str
     stdout: str
@@ -700,37 +772,30 @@ OutputT = Result | Error
 Output = TypeAdapter(OutputT)
 
 
+# The execution of python is what makes the agent general and able to
+# do "anything".
+# Python runs in pyodide in deno. It just allows us to use a
+# sandbox. The same could be done through containers or some other
+# technology. This was just the easistest for me at the time of
+# writing it as it required the least amount of setup and comes
+# with some default packages that we can use/activate.
 class Python(StdoutMixin):
+    command: list[str] = [
+        "deno",
+        "run",
+        "--no-prompt",
+        "--cached-only",
+        "--deny-net",
+        f"--allow-read={Path('node_modules').absolute()},{DATA_DIR}",
+        Path("src/sandbox/run.ts").absolute(),
+    ]
+
     def __init__(self, agent: Agent):
         self.agent = agent
         self.process = None
         self.lock = asyncio.Lock()
 
     async def __aenter__(self) -> Self:
-
-        node_modules = Path("node_modules")
-        node_modules = await asyncio.to_thread(node_modules.absolute)
-
-        script = Path("src/sandbox/run.ts")
-        script = await asyncio.to_thread(script.absolute)
-
-        command = [
-            "deno",
-            "run",
-            "--no-prompt",
-            "--cached-only",
-            "--deny-net",
-            f"--allow-read={node_modules},{DATA_DIR}",
-            script,
-        ]
-
-        self.process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            limit=128 * 1024 * 1024,
-        )
-
         return self
 
     async def __aexit__(
@@ -739,8 +804,9 @@ class Python(StdoutMixin):
         exc_val: BaseException | None,
         tb: TracebackType | None,
     ):
-        self.process.terminate()
-        await self.process.wait()
+        if self.process:
+            self.process.terminate()
+            await self.process.wait()
 
     async def execute_python(
         self, code: Annotated[str, Field(description="The python code to execute")]
@@ -762,10 +828,24 @@ class Python(StdoutMixin):
 
         self.stdout(code, sep="!")
 
-        data = json.dumps({"code": code})
+        data = Code(code=code)
+        data = data.model_dump_json()
+        data = data.encode()
 
+        # We allow parallel tool calls, but we shouldn't allow parallel python calls...
         async with self.lock:
-            self.process.stdin.writelines([data.encode(), b"\n"])
+            # Small memory optimisation here... if the agent never
+            # uses the process we should not create the expensive
+            # process
+            if not self.process:
+                self.process = await asyncio.create_subprocess_exec(
+                    *self.command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    limit=128 * 1024 * 1024,  # The output can be quite big...
+                )
+
+            self.process.stdin.writelines([data, b"\n"])
             await self.process.stdin.drain()
 
             output = await self.process.stdout.readline()
@@ -797,6 +877,9 @@ class ToolNotFoundError(Exception):
     pass
 
 
+# The execution of an agent is not that complex actually! Lets think
+# about it: What does an agent need to be functional and fully
+# configurable?
 class Runner(StdoutMixin):
     def __init__(
         self,
@@ -806,7 +889,7 @@ class Runner(StdoutMixin):
         tools: list[Tool],
     ):
         self.llm = llm
-        self.agent = agent
+        self.agent = agent  # just for pretty printing
         self.frames = frames
         self.tools = {tool.__name__: tool for tool in tools}
 
@@ -839,11 +922,10 @@ class Runner(StdoutMixin):
 
     async def run(
         self,
-        user: Agent,
+        user: Agent,  # <- also for pretty printing
         task: str,
         text_format: type[BaseModel] | None = None,
     ) -> BaseModel | str:
-
         self.stdout("system")
         self.stdout("---------")
 
@@ -884,17 +966,42 @@ class Runner(StdoutMixin):
         return response
 
 
-def vote(solutions: list[str]) -> int | None:
+# No agent directly collaborates in a task, but they collaborate
+# through voting and evaluation. Over time, the evaluation and
+# updating of their belief of other agents success/failure will create
+# communities of practice.
+#
+# This could be improved by allowing an agent to refuse a task.
+
+# import tiktoken
+# import struct
+# encoding = tiktoken.get('o200k_base')
+
+
+def vote(agents: Agents, solutions: list[str]) -> tuple[Agent, str]:
     # The solution with the lowest Normalized Compression Distance to
     # the other solutions wins the vote!
+    #
+    # ref: https://en.wikipedia.org/wiki/Normalized_compression_distance
+    # ref: https://maxhalford.github.io/blog/text-classification-zstd/
+    #
+    # Alternative with embeddings: https://arxiv.org/abs/2402.05120
 
     idx, best = None, math.inf
-    solutions = [s.encode() for s in solutions]
 
-    for i, x in enumerate(solutions):
+    # data = map(str.casefold, solutions) ??
+    data = [s.encode() for s in solutions]
+
+    # Whould be interesting to test with and without token encoding and
+    # look at what performs better. Could we encode phrases instead?
+
+    # data = map(encoding.encode, solutions)
+    # data = [struct.pack(f">{len(s)}I", *s) for s in data]
+
+    for i, x in enumerate(data):
         c = zstd.ZstdCompressor()
 
-        y_z = chain(solutions[:i], solutions[i + 1 :])
+        y_z = chain(data[:i], data[i + 1 :])
         y_z = zip_longest([], y_z, fillvalue=b"\n")
         y_z = islice(chain.from_iterable(y_z), 1)
         y_z = sum(len(b) for b in map(c.compress, y_z))
@@ -908,11 +1015,13 @@ def vote(solutions: list[str]) -> int | None:
 
         idx, best = min((idx, best), (i, dist), key=op.itemgetter(1))
 
-    return idx
+    return agents[idx], solutions[idx]
 
 
 EVAL_PROMPT = """\
 Please evaluate if the tasks was solved in a satisfactory way.
+
+Check your notebook for any acceptance criteria for the task.
 
 TASK:
 {task}
@@ -931,16 +1040,24 @@ class Solution(BaseModel):
     solution: str
 
 
-semaphore = asyncio.Semaphore(value=100)
+# It can take a lot of memory and put a lot of contention on the llm
+# if we run too many agents at the same time.
+agent_limit = asyncio.Semaphore(value=50)
 
 
+# This is a naive implementation based on promise theory. An agent
+# promises that it will evaluate and accept an answer if the other
+# agent promises to provide an answer.
+#
+# ref: https://markburgess.org/promises.html
 class Orchestrator(StdoutMixin):
     def __init__(self, agent: Agent, llm: LLM):
         self.agent = agent
         self.llm = llm
 
     async def assign(self, agent: Agent, task: str) -> str:
-        async with semaphore, Python(agent) as py:
+        # I don't like the py context manger here
+        async with agent_limit, Python(agent) as py:
             notebook = Notebook(agent)
             orchestrator = Orchestrator(agent, self.llm)
 
@@ -971,7 +1088,6 @@ class Orchestrator(StdoutMixin):
             return output
 
     async def evaluate(self, agent: Agent, task: str, solution: str) -> str:
-
         notebook = Notebook(self.agent)
         runner = Runner(
             llm=self.llm,
@@ -1002,6 +1118,11 @@ class Orchestrator(StdoutMixin):
         except ValidationError:
             return "failure"
 
+    # This is also a tool! It can also be thought of a as a step in
+    # behavioural programming, Each b-thread agent cannot directly
+    # block other behaviours, but the there are requests of work and
+    # some events are blocked by not being voted as next.
+    # ref: https://lmatteis.github.io/react-behavioral/
     async def request(
         self,
         task: Annotated[str, Field(description="Detailed description of the task")],
@@ -1020,9 +1141,7 @@ class Orchestrator(StdoutMixin):
         solutions = starmap(self.assign, solutions)
         solutions = await asyncio.gather(*solutions)
 
-        i = await asyncio.to_thread(vote, solutions)
-
-        agent, solution = agents[i], solutions[i]
+        agent, solution = await asyncio.to_thread(vote, agents, solutions)
 
         await self.evaluate(agent, task, solution)
 
@@ -1030,7 +1149,6 @@ class Orchestrator(StdoutMixin):
 
 
 async def main():
-
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -1044,9 +1162,9 @@ async def main():
         agent = await asyncio.to_thread(init_app)
         solution = await orchestrator.assign(agent, args.TASK)
 
-        print(f"000| {agent.name}")
-        print(f"000|------")
-        text = textwrap.indent(solution, f"000| ")
+        print(f"0000| {agent.name}")
+        print("0000|------")
+        text = textwrap.indent(solution, "0000| ")
         print(text)
 
 
