@@ -78,15 +78,21 @@ The tasks you are given can be very complex, so follow these steps:
   - Note down interesting information in your notebook
   - Divide the task into sub-tasks
   - Note down acceptance criteria for your sub-tasks in your notebook
-  - Request specialist agents do the sub-tasks
   - Compile a report from your findings
 
-The user will not be available before you complete the task. If you
-need help to interpret the task you should ask a specialist.
+The user will not be available before you complete the task.
+ """
+
+DELEGATE_PROMPT = """\
+Request specialist agents do the sub-tasks.
+
+If you need help to interpret the task you should ask a specialist.
 
 Try to delegate as many tasks as you can, unless it is a single simple
 task that you can solve immediately.
- """
+"""
+
+DEPTH = 3
 
 # I didn't want to implement user and agent feedback. It could be a
 # cool thing to continue with....
@@ -182,6 +188,7 @@ class LLM:
         tools: list[ToolParam],
         text_format: type[BaseModel] | None = None,
     ) -> Response:
+
         kwargs = {}
         if text_format:
             # I am not handling $ref here. I am not sure if that is
@@ -197,23 +204,23 @@ class LLM:
 
             kwargs = {
                 "text": {
+                    "verbosity": "low",
                     "format": {
                         "name": text_format.__name__,
                         "type": "json_schema",
                         "strict": True,
                         "schema": schema,
-                    }
+                    },
                 }
             }
 
         for i in range(1, MAX_RETRY_LIMIT + 1):
             async with Attempt(self.lock, i) as attempt:
-                return await self.client.responses.create(
+                response = await self.client.responses.create(
                     model=MODEL_DEPLOYMENT,
                     input=messages,
                     tools=tools,
                     tool_choice="auto",
-                    parallel_tool_calls=True,
                     reasoning={
                         "effort": "low",
                         "summary": "concise",
@@ -222,6 +229,7 @@ class LLM:
                     store=False,
                     **kwargs,
                 )
+                return response
 
         raise attempt.exception
 
@@ -691,6 +699,8 @@ class Notebook(StdoutMixin):
         the content is not valuable now, it might be useful later.
         """
 
+        Rem += 1
+
         id = await asyncio.to_thread(delete_note, self.agent, id)
 
         self.stdout(f"Note#{id if id else '~'}", sep="~")
@@ -733,6 +743,7 @@ class Notebook(StdoutMixin):
 
         The search uses the fts5 extension in sqlite.
         """
+
         query = query.replace("-", " ")
         self.stdout(f"SEARCH {query!r}", sep="$")
 
@@ -1042,7 +1053,7 @@ class Solution(BaseModel):
 
 # It can take a lot of memory and put a lot of contention on the llm
 # if we run too many agents at the same time.
-agent_limit = asyncio.Semaphore(value=50)
+agent_limit = asyncio.Semaphore(value=100)
 
 
 # This is a naive implementation based on promise theory. An agent
@@ -1051,31 +1062,39 @@ agent_limit = asyncio.Semaphore(value=50)
 #
 # ref: https://markburgess.org/promises.html
 class Orchestrator(StdoutMixin):
-    def __init__(self, agent: Agent, llm: LLM):
+    def __init__(self, agent: Agent, llm: LLM, depth=0):
         self.agent = agent
         self.llm = llm
+        self.depth = depth
 
     async def assign(self, agent: Agent, task: str) -> str:
         # I don't like the py context manger here
-        async with agent_limit, Python(agent) as py:
+        async with Python(agent) as py, agent_limit:
             notebook = Notebook(agent)
-            orchestrator = Orchestrator(agent, self.llm)
+            orchestrator = Orchestrator(agent, self.llm, depth=self.depth + 1)
+
+            system_prompt = [SYSTEM_PROMPT]
+
+            tools = [
+                notebook.add_note,
+                notebook.remove_note,
+                notebook.get_note,
+                notebook.search,
+                py.execute_python,
+            ]
+
+            if orchestrator.depth < DEPTH:
+                system_prompt.append(DELEGATE_PROMPT)
+                tools.append(orchestrator.request)
 
             runner = Runner(
                 llm=self.llm,
                 agent=agent,
                 frames=[
-                    SYSTEM_PROMPT,
+                    *system_prompt,
                     notebook.summary,
                 ],
-                tools=[
-                    notebook.add_note,
-                    notebook.remove_note,
-                    notebook.get_note,
-                    notebook.search,
-                    py.execute_python,
-                    orchestrator.request,
-                ],
+                tools=tools,
             )
 
             response = await runner.run(self.agent, task)
@@ -1130,21 +1149,33 @@ class Orchestrator(StdoutMixin):
         """
         Request that a task is done by a specialist.
         """
-        agents = repeat((sample, self.agent), MAX_VOTES)
-        agents = starmap(asyncio.to_thread, agents)
-        agents = await asyncio.gather(*agents)
+        try:
+            # Ugly, but we need to keep the number of agents running
+            # at the same time down. There should be a better solution
+            # if we implement the "harness" using worker threads and a
+            # queue system instead.
+            #
+            # What we are solving here is that we want only n agents
+            # running, but when we are waiting for other agents to
+            # answer we need to not block the semaphore.
+            agent_limit.release()
 
-        self.stdout(f"REQ {', '.join(a.name for a in agents)}", sep="#")
-        self.stdout(task, sep="#")
+            agents = repeat((sample, self.agent), MAX_VOTES)
+            agents = starmap(asyncio.to_thread, agents)
+            agents = await asyncio.gather(*agents)
 
-        solutions = zip_longest(agents, [], fillvalue=task)
-        solutions = starmap(self.assign, solutions)
-        solutions = await asyncio.gather(*solutions)
+            self.stdout(f"REQ {', '.join(a.name for a in agents)}", sep="#")
+            self.stdout(task, sep="#")
+
+            solutions = zip_longest(agents, [], fillvalue=task)
+            solutions = starmap(self.assign, solutions)
+            solutions = await asyncio.gather(*solutions)
+        finally:
+            await agent_limit.acquire()
 
         agent, solution = await asyncio.to_thread(vote, agents, solutions)
 
         await self.evaluate(agent, task, solution)
-
         return Solution(solution=solution)
 
 
