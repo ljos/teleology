@@ -31,7 +31,13 @@ import azure.identity.aio as identity
 import openai
 
 from faker import Faker  # not strictly needed, but makes it more fun...
-from openai import APIConnectionError, InternalServerError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    BadRequestError,
+    RateLimitError,
+)
 from openai.types.responses import Response, ToolParam
 from openai.types.responses import ResponseFunctionToolCall as ToolCall
 from openai.types.responses import ResponseInputParam as Message
@@ -58,11 +64,6 @@ MAX_STEPS = os.environ.get("TELE_MAX_STEPS", 100)
 MAX_VOTES = os.environ.get("TELE_MAX_VOTES", 3)
 MAX_RETRY_LIMIT = os.environ.get("TELE_RETRY_LIMIT", 5)
 
-
-# MAD agents Each agent divides its task into sub-tasks and requests
-# "specialist" agents to solve the new sub-task, making the actual
-# task each agent solves small.
-# ref: https://arxiv.org/html/2511.09030v1
 
 SYSTEM_PROMPT = """\
 You are a helpful agent.
@@ -92,10 +93,15 @@ Try to delegate as many tasks as you can, unless it is a single simple
 task that you can solve immediately.
 """
 
-DEPTH = 3
+DEPTH = 5
 
 # I didn't want to implement user and agent feedback. It could be a
 # cool thing to continue with....
+
+
+ServerError = (
+    APIConnectionError | InternalServerError | APITimeoutError | BadRequestError
+)
 
 
 class Attempt(AbstractAsyncContextManager):
@@ -124,7 +130,7 @@ class Attempt(AbstractAsyncContextManager):
         if isinstance(exc_val, ValidationError):
             return True
 
-        if isinstance(exc_val, APIConnectionError | InternalServerError):
+        if isinstance(exc_val, ServerError):
             await asyncio.sleep(1.0 + self.retry**2)
             return True
 
@@ -148,29 +154,74 @@ class Attempt(AbstractAsyncContextManager):
                 return True
 
 
+class RateLimiter:
+    def __init__(self, retries: int = 5):
+        self.lock = asyncio.Lock()
+        self.retries = retries
+
+    async def __call__(self, func, *args, **kwargs):
+        for i in range(self.retries):
+            async with Attempt(self.lock, i) as attempt:
+                return await func(*args, **kwargs)
+
+        raise attempt.exception
+
+
+class RateLimitWrapper:
+    __slots__ = ("target", "rate_limited", "model")
+
+    def __init__(self, target, limiter, model):
+        self.target = target
+        self.rate_limited = limiter
+        self.model = model
+
+    async def available(self):
+        async with self.rate_limited.lock:
+            return self
+
+    def __getattr__(self, name):
+        attr = getattr(self.target, name)
+        return RateLimitWrapper(attr, self.rate_limited, self.model)
+
+    async def __call__(self, *args, **kwargs):
+        kwargs["model"] = self.model
+
+        value = await self.rate_limited(self.target, *args, **kwargs)
+        return value
+
+
 class LLM:
     def __init__(self):
+        self.limit = asyncio.Semaphore(value=25)
+
         self.client = None
         self.lock = None
 
-        self._stack = None
+        self.stack = None
 
     async def __aenter__(self) -> Self:
         self.lock = asyncio.Lock()
 
-        self._stack = contextlib.AsyncExitStack()
+        self.stack = contextlib.AsyncExitStack()
 
-        self.client = await self._stack.enter_async_context(
+        limiter = RateLimiter(MAX_RETRY_LIMIT)
+
+        client = await self.stack.enter_async_context(
             openai.AsyncOpenAI(
                 base_url=f"{MODEL_ENDPOINT}/openai/v1",
                 api_key=identity.get_bearer_token_provider(
-                    await self._stack.enter_async_context(  # <- this is why I use the stack
+                    await self.stack.enter_async_context(  # <- this is why I use the stack
                         identity.DefaultAzureCredential()
                     ),
                     "https://cognitiveservices.azure.com/.default",
                 ),
             )
         )
+
+        client = RateLimitWrapper(client, limiter, MODEL_DEPLOYMENT)
+
+        self.client = client
+
         return self
 
     async def __aexit__(
@@ -180,7 +231,7 @@ class LLM:
         tb: TracebackType | None,
     ):
         self.lock, self.client = None, None
-        await self._stack.aclose()
+        await self.stack.aclose()
 
     async def ask(
         self,
@@ -214,24 +265,27 @@ class LLM:
                 }
             }
 
-        for i in range(1, MAX_RETRY_LIMIT + 1):
-            async with Attempt(self.lock, i) as attempt:
-                response = await self.client.responses.create(
-                    model=MODEL_DEPLOYMENT,
-                    input=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    reasoning={
-                        "effort": "low",
-                        "summary": "concise",
-                    },
-                    include=["reasoning.encrypted_content"],
-                    store=False,
-                    **kwargs,
-                )
-                return response
+        async with self.limit:
+            response = await self.client.responses.create(
+                input=messages,
+                tools=tools,
+                tool_choice="auto",
+                reasoning={
+                    "effort": "low",
+                    "summary": "concise",
+                },
+                include=["reasoning.encrypted_content"],
+                store=False,
+                context_management=[
+                    {
+                        "type": "compaction",
+                        "compact_threshold": 200000,
+                    }
+                ],
+                **kwargs,
+            )
 
-        raise attempt.exception
+        return response
 
 
 class GenerateJsonSchema(GenerateJsonSchema):
@@ -1051,11 +1105,6 @@ class Solution(BaseModel):
     solution: str
 
 
-# It can take a lot of memory and put a lot of contention on the llm
-# if we run too many agents at the same time.
-agent_limit = asyncio.Semaphore(value=100)
-
-
 # This is a naive implementation based on promise theory. An agent
 # promises that it will evaluate and accept an answer if the other
 # agent promises to provide an answer.
@@ -1069,7 +1118,7 @@ class Orchestrator(StdoutMixin):
 
     async def assign(self, agent: Agent, task: str) -> str:
         # I don't like the py context manger here
-        async with Python(agent) as py, agent_limit:
+        async with Python(agent) as py:
             notebook = Notebook(agent)
             orchestrator = Orchestrator(agent, self.llm, depth=self.depth + 1)
 
@@ -1149,34 +1198,28 @@ class Orchestrator(StdoutMixin):
         """
         Request that a task is done by a specialist.
         """
-        try:
-            # Ugly, but we need to keep the number of agents running
-            # at the same time down. There should be a better solution
-            # if we implement the "harness" using worker threads and a
-            # queue system instead.
-            #
-            # What we are solving here is that we want only n agents
-            # running, but when we are waiting for other agents to
-            # answer we need to not block the semaphore.
-            agent_limit.release()
 
-            agents = repeat((sample, self.agent), MAX_VOTES)
-            agents = starmap(asyncio.to_thread, agents)
-            agents = await asyncio.gather(*agents)
+        agents = repeat((sample, self.agent), MAX_VOTES)
+        agents = starmap(asyncio.to_thread, agents)
+        agents = await asyncio.gather(*agents)
 
-            self.stdout(f"REQ {', '.join(a.name for a in agents)}", sep="#")
-            self.stdout(task, sep="#")
+        self.stdout(f"REQ {', '.join(a.name for a in agents)}", sep="#")
+        self.stdout(task, sep="#")
 
-            solutions = zip_longest(agents, [], fillvalue=task)
-            solutions = starmap(self.assign, solutions)
-            solutions = await asyncio.gather(*solutions)
-        finally:
-            await agent_limit.acquire()
+        solutions = zip_longest(agents, [], fillvalue=task)
+        solutions = starmap(self.assign, solutions)
+        solutions = await asyncio.gather(*solutions)
 
         agent, solution = await asyncio.to_thread(vote, agents, solutions)
 
         await self.evaluate(agent, task, solution)
         return Solution(solution=solution)
+
+
+# MAD agents Each agent divides its task into sub-tasks and requests
+# "specialist" agents to solve the new sub-task, making the actual
+# task each agent solves small.
+# ref: https://arxiv.org/html/2511.09030v1
 
 
 async def main():
