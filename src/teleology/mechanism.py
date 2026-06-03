@@ -1068,7 +1068,8 @@ def vote(agents: Agents, solutions: list[str]) -> tuple[Agent, str]:
 
         y_z = chain(data[:i], data[i + 1 :])
         y_z = zip_longest([], y_z, fillvalue=b"\n")
-        y_z = islice(chain.from_iterable(y_z), 1)
+        y_z = islice(chain.from_iterable(y_z), 1, None)
+
         y_z = sum(len(b) for b in map(c.compress, y_z))
         y_z = y_z + len(c.flush(mode=c.FLUSH_BLOCK))
 
