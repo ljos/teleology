@@ -3,11 +3,11 @@
 import asyncio
 import contextlib
 import functools
+import heapq
 import inspect
 import math
 import operator as op
 import os
-import random
 import re
 import sqlite3
 import textwrap
@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Iterable
 from compression import zstd
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta
-from itertools import chain, islice, repeat, starmap, zip_longest
+from itertools import chain, islice, zip_longest, starmap
 from pathlib import Path
 
 # I use typing and types, but I don't generally use any type checker.
@@ -60,9 +60,9 @@ MODEL_DEPLOYMENT = os.environ["AZURE_OPENAI_MODEL"]
 DATABASE = os.environ.get("TELE_DATABASE", "data.sqlite")
 DATA_DIR = Path(os.environ.get("TELE_DATA_DIR", "data")).absolute()
 
-MAX_STEPS = os.environ.get("TELE_MAX_STEPS", 100)
 MAX_VOTES = os.environ.get("TELE_MAX_VOTES", 3)
 MAX_RETRY_LIMIT = os.environ.get("TELE_RETRY_LIMIT", 5)
+MAX_STEPS = os.environ.get("TELE_MAX_STEPS", 100)
 
 
 SYSTEM_PROMPT = """\
@@ -93,7 +93,7 @@ Try to delegate as many tasks as you can, unless it is a single simple
 task that you can solve immediately.
 """
 
-DEPTH = 5
+DEPTH = 3
 
 # I didn't want to implement user and agent feedback. It could be a
 # cool thing to continue with....
@@ -239,7 +239,6 @@ class LLM:
         tools: list[ToolParam],
         text_format: type[BaseModel] | None = None,
     ) -> Response:
-
         kwargs = {}
         if text_format:
             # I am not handling $ref here. I am not sure if that is
@@ -317,9 +316,9 @@ class Database:
         self.conn = sqlite3.connect(database, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
 
-    def create_function(self, *args, **kwargs):
+    def create_aggregate(self, *args, **kwargs):
         with self.lock:
-            return self.conn.create_function(*args, **kwargs)
+            return self.conn.create_aggregate(*args, **kwargs)
 
     def execute(self, query: str, params: tuple | list[tuple] = ()):
         with self.lock:
@@ -351,13 +350,107 @@ class Agent(BaseModel):
     name: str
 
 
+# No agent directly collaborates in a task, but they collaborate
+# through voting and evaluation. Over time, the evaluation and
+# updating of their belief of other agents success/failure will create
+# communities of practice.
+#
+# Their belief is based on voting whose notes are most similar given
+# the task.
+#
+# This could be improved by allowing an agent to refuse a task.
+
+# import tiktoken
+# import struct
+# encoding = tiktoken.get('o200k_base')
+
+
+def vote(agents: list[Agent], solutions: list[str]) -> tuple[Agent, str]:
+    # The solution with the lowest Normalized Compression Distance to
+    # the other solutions wins the vote!
+    #
+    # ref: https://en.wikipedia.org/wiki/Normalized_compression_distance
+    # ref: https://maxhalford.github.io/blog/text-classification-zstd/
+    #
+    # Alternative with embeddings: https://arxiv.org/abs/2402.05120
+
+    values = []
+
+    # data = map(str.casefold, solutions) ??
+    data = [s.encode() for s in solutions]
+
+    # Whould be interesting to test with and without token encoding and
+    # look at what performs better. Could we encode phrases instead?
+
+    # data = map(encoding.encode, solutions)
+    # data = [struct.pack(f">{len(s)}I", *s) for s in data]
+
+    for i, x in enumerate(data):
+        c = zstd.ZstdCompressor()
+
+        y_z = chain(data[:i], data[i + 1 :])
+        y_z = zip_longest([], y_z, fillvalue=b"\n")
+        y_z = islice(chain.from_iterable(y_z), 1, None)
+
+        y_z = sum(len(b) for b in map(c.compress, y_z))
+        y_z = y_z + len(c.flush(mode=c.FLUSH_BLOCK))
+
+        x_z = len(zstd.compress(x))
+
+        xy_z = y_z + len(c.compress(x)) + len(c.flush())
+
+        dist = (xy_z - min(x_z, y_z)) / max(x_z, y_z)
+
+        heapq.heappush(values, (dist, i))
+
+    _agents = []
+    _solutions = []
+    for _, i in values:
+        _agents.append(agents[i])
+        _solutions.append(solutions[i])
+
+    return _agents, _solutions
+
+
+# Agent reward is not through a capitalist monetary reward system, but
+# relies on previous behaviour and meritocracy.
+
+# Eventually this _should_ create specialisation, and
+# collaboration without hierarchy.
+#
+# A key component of other agent systems that I have seen either
+# relies on some form of tokens and on a single leader/orchestrator
+# that is responsible for keeping track of work. Here all agents are
+# treated as equal and can be a orchestrator.
+
+
+def find_top_solvers(task: str, n=MAX_VOTES) -> list[Agent]:
+    idents, names, notes = zip(
+        *db.execute(
+            """
+            WITH
+            text (id, content) AS (
+                SELECT agent.id, note.title || note.content
+                FROM agent LEFT JOIN note ON agent.id = note.agent_id
+                ORDER BY visited_at DESC
+                LIMIT :n
+            )
+            SELECT agent.id, agent.name, COALESCE(GROUP_CONCAT(text.content, ""), "")
+            FROM agent LEFT JOIN text ON agent.id = text.id
+            GROUP BY agent.id
+        """,
+            {"n": n},
+        )
+    )
+
+    agents = [Agent(id=ident, name=name) for ident, name in zip(idents, names)]
+    agents, _ = vote(agents, [n + task for n in notes])
+    return agents[:MAX_VOTES]
+
+
 # Setup the database and find the first agent.
 def init_app() -> Agent:
     db.execute("PRAGMA journal_mode=WAL")
-
-    # We want to use sampling to find agents--easiest if we can do it
-    # in the database.
-    db.create_function("betavariate", 2, random.betavariate, deterministic=False)
 
     db.execute(
         """
@@ -366,40 +459,6 @@ def init_app() -> Agent:
             name TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
-        """
-    )
-
-    # Each agent has a belief about how well another agent will
-    # perform based on what they themselves have observed of successes
-    # and failures.
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS belief (
-           id INTEGER PRIMARY KEY,
-           agent_id INTEGER NOT NULL,
-           target_id INTEGER NOT NULL,
-
-           success INTEGER NOT NULL DEFAULT 0,
-           failure INTEGER NOT NULL DEFAULT 0,
-
-           FOREIGN KEY (agent_id) REFERENCES agent (id),
-           FOREIGN KEY (target_id) REFERENCES agent (id)
-        )
-        """
-    )
-    db.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_belief_agent_target ON belief (agent_id, target_id)
-        """
-    )
-    db.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_belief_agent_id ON belief (agent_id)
-        """
-    )
-    db.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_belief_target_id ON belief (target_id)
         """
     )
 
@@ -464,115 +523,7 @@ def init_app() -> Agent:
             [(fake.name(),) for _ in range(n)],
         )
 
-    # We use Thompson sampling to find a suitable agent
-    # https://en.wikipedia.org/wiki/Thompson_sampling
-    ident, name, p = db.execute(
-        """
-        WITH outcome (id, name, success, failure) AS (
-          SELECT
-            agent.id,
-            agent.name,
-            coalesce(sum(belief.success), 0) + 1,
-            coalesce(sum(belief.failure), 0) + 1
-          FROM agent
-          LEFT JOIN belief ON agent.id = belief.target_id
-          GROUP BY agent.id
-        )
-        SELECT id, name, betavariate(success, failure) as p
-        FROM outcome
-        ORDER BY p DESC
-        LIMIT 1
-        """
-    )[0]
-
-    # If our candidate has a probabilty of less than 50%, we create a
-    # new one.
-    if p < 0.5:
-        name = fake.name()
-        (ident,) = db.execute(
-            "INSERT INTO agent (name) VALUES (:name) RETURNING id",
-            {"name": name},
-        )[0]
-
-    return Agent(id=ident, name=name)
-
-
-# Agent reward is not through a capitalist monetary reward system, but
-# relies on trust and experience. Each agent chooses using sampling
-# from observed success and failure among the other agents.
-#
-# Eventually this _should_ create specialisation, community, and
-# collaboration without hierarchy.
-#
-# A key component of other agent systems that I have seen either
-# relies on some form of tokens and on a single leader/orchestrator
-# that is responsible for keeping track of work. Here all agents are
-# treated as equal and can be a orchestrator.
-
-
-# A particular agent can also use Thompson sampling to find a suitable
-# candidate to delegate a task to.
-def sample(agent: Agent) -> Agent:
-    ident, name, p = db.execute(
-        """
-        WITH outcome (id, name, success, failure) AS (
-            SELECT
-                agent.id,
-                agent.name,
-                coalesce(sum(belief.success), 0) + 1,
-                coalesce(sum(belief.failure), 0) + 1
-            FROM agent LEFT JOIN belief ON agent.id = belief.target_id
-            WHERE agent.id = :id
-            GROUP BY agent.id
-        )
-        SELECT id, name, betavariate(success, failure) AS p
-        FROM outcome
-        ORDER BY p DESC
-        LIMIT 1
-        """,
-        {"id": agent.id},
-    )[0]
-
-    if p < 0.5:
-        for _ in range(10):
-            with contextlib.suppress(sqlite3.IntegrityError):
-                name = fake.name()
-                (ident,) = db.execute(
-                    "INSERT INTO agent (name) VALUES (:name) RETURNING id",
-                    {"name": name},
-                )[0]
-                break
-
-    return Agent(id=ident, name=name)
-
-
-# After delegation, the agent needs to update its belief.
-def update_belief(
-    agent: Agent,
-    target: Agent,
-    status: Literal["success", "failure"],
-) -> None:
-    db.execute(
-        """
-        INSERT OR IGNORE INTO belief (agent_id, target_id, success, failure)
-        VALUES (:aid, :tid, 0, 0)
-        """,
-        {"aid": agent.id, "tid": target.id},
-    )
-    db.execute(
-        """
-        UPDATE belief
-        SET success = success + :success,
-            failure = failure + :failure
-        WHERE agent_id = :aid AND target_id = :tid
-        """,
-        {
-            "aid": agent.id,
-            "tid": target.id,
-            "success": int(status == "success"),
-            "failure": int(status == "failure"),
-        },
-    )
+    return find_top_solvers("Task evaluation, splitting, and orchestrator.")[0]
 
 
 def insert_note(agent: Agent, title: str, content: str) -> int:
@@ -752,8 +703,6 @@ class Notebook(StdoutMixin):
         Deleting notes should be considered very carefully, even if
         the content is not valuable now, it might be useful later.
         """
-
-        Rem += 1
 
         id = await asyncio.to_thread(delete_note, self.agent, id)
 
@@ -1031,59 +980,6 @@ class Runner(StdoutMixin):
         return response
 
 
-# No agent directly collaborates in a task, but they collaborate
-# through voting and evaluation. Over time, the evaluation and
-# updating of their belief of other agents success/failure will create
-# communities of practice.
-#
-# This could be improved by allowing an agent to refuse a task.
-
-# import tiktoken
-# import struct
-# encoding = tiktoken.get('o200k_base')
-
-
-def vote(agents: Agents, solutions: list[str]) -> tuple[Agent, str]:
-    # The solution with the lowest Normalized Compression Distance to
-    # the other solutions wins the vote!
-    #
-    # ref: https://en.wikipedia.org/wiki/Normalized_compression_distance
-    # ref: https://maxhalford.github.io/blog/text-classification-zstd/
-    #
-    # Alternative with embeddings: https://arxiv.org/abs/2402.05120
-
-    idx, best = None, math.inf
-
-    # data = map(str.casefold, solutions) ??
-    data = [s.encode() for s in solutions]
-
-    # Whould be interesting to test with and without token encoding and
-    # look at what performs better. Could we encode phrases instead?
-
-    # data = map(encoding.encode, solutions)
-    # data = [struct.pack(f">{len(s)}I", *s) for s in data]
-
-    for i, x in enumerate(data):
-        c = zstd.ZstdCompressor()
-
-        y_z = chain(data[:i], data[i + 1 :])
-        y_z = zip_longest([], y_z, fillvalue=b"\n")
-        y_z = islice(chain.from_iterable(y_z), 1, None)
-
-        y_z = sum(len(b) for b in map(c.compress, y_z))
-        y_z = y_z + len(c.flush(mode=c.FLUSH_BLOCK))
-
-        x_z = len(zstd.compress(x))
-
-        xy_z = y_z + len(c.compress(x)) + len(c.flush())
-
-        dist = (xy_z - min(x_z, y_z)) / max(x_z, y_z)
-
-        idx, best = min((idx, best), (i, dist), key=op.itemgetter(1))
-
-    return agents[idx], solutions[idx]
-
-
 EVAL_PROMPT = """\
 Please evaluate if the tasks was solved in a satisfactory way.
 
@@ -1156,42 +1052,6 @@ class Orchestrator(StdoutMixin):
 
             return output
 
-    async def evaluate(self, agent: Agent, task: str, solution: str) -> str:
-        notebook = Notebook(self.agent)
-        runner = Runner(
-            llm=self.llm,
-            agent=self.agent,
-            frames=[
-                SYSTEM_PROMPT,
-                notebook.summary,
-            ],
-            tools=[
-                notebook.get_note,
-                notebook.search,
-            ],
-        )
-
-        evaluation = await runner.run(
-            agent,
-            EVAL_PROMPT.format(task=task, solution=solution),
-            text_format=Evaluation,
-        )
-
-        self.stdout(f"{agent.name} - {evaluation.status}", sep="%")
-        await asyncio.to_thread(update_belief, self.agent, agent, evaluation.status)
-
-        try:
-            evaluation = evaluation.output[1].content[0].text
-            evaluation = Evaluation.model_validate_json(evaluation)
-            return evaluation.reason
-        except ValidationError:
-            return "failure"
-
-    # This is also a tool! It can also be thought of a as a step in
-    # behavioural programming, Each b-thread agent cannot directly
-    # block other behaviours, but the there are requests of work and
-    # some events are blocked by not being voted as next.
-    # ref: https://lmatteis.github.io/react-behavioral/
     async def request(
         self,
         task: Annotated[str, Field(description="Detailed description of the task")],
@@ -1200,9 +1060,7 @@ class Orchestrator(StdoutMixin):
         Request that a task is done by a specialist.
         """
 
-        agents = repeat((sample, self.agent), MAX_VOTES)
-        agents = starmap(asyncio.to_thread, agents)
-        agents = await asyncio.gather(*agents)
+        agents = await asyncio.to_thread(find_top_solvers, task)
 
         self.stdout(f"REQ {', '.join(a.name for a in agents)}", sep="#")
         self.stdout(task, sep="#")
@@ -1211,10 +1069,9 @@ class Orchestrator(StdoutMixin):
         solutions = starmap(self.assign, solutions)
         solutions = await asyncio.gather(*solutions)
 
-        agent, solution = await asyncio.to_thread(vote, agents, solutions)
+        _, solutions = await asyncio.to_thread(vote, agents, solutions)
 
-        await self.evaluate(agent, task, solution)
-        return Solution(solution=solution)
+        return Solution(solution=solutions[0])
 
 
 # MAD agents Each agent divides its task into sub-tasks and requests
